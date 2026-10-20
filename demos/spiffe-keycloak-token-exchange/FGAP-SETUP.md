@@ -9,6 +9,8 @@ For each new sandbox, the interceptor:
 2. Creates a client policy for the sandbox's SPIFFE ID
 3. Links the policy to the `token-exchange` scope permission on the audience
 
+The audience clients are derived from `DEFAULT_CLIENT_SCOPES` (no separate configuration needed).
+
 This requires the interceptor's service account to have the `manage-authorization` role on `realm-management`, in addition to the existing `manage-clients`, `view-clients`, and `query-clients` roles.
 
 ## Adding the manage-authorization role
@@ -46,20 +48,11 @@ curl -sk -X POST "$KC_URL/admin/realms/$REALM/users/$SA_USER/role-mappings/clien
   -d "[{\"id\":\"$ROLE_ID\",\"name\":\"manage-authorization\"}]"
 ```
 
-## Gateway FGAP permissions (one-time)
+## Gateway FGAP permissions
 
-The gateway client (`spiffe://openshell.local/ns/openshell/sa/openshell`) also needs FGAP token-exchange permissions to exchange tokens to `model-api`. Unlike sandbox clients, the gateway is not created by the interceptor, so its FGAP permissions must be configured once manually.
+The interceptor now automatically configures FGAP permissions for the gateway client alongside each sandbox. No manual configuration is needed.
 
-Use `configure-fgap.sh` with:
-
-```bash
-export KEYCLOAK_URL="<your keycloak URL>"
-export KEYCLOAK_ADMIN_USER="<admin>"
-export KEYCLOAK_ADMIN_PASS="<password>"
-bash configure-fgap.sh
-```
-
-This script configures FGAP permissions for all federated-jwt clients in the realm, including the gateway. Run it once after the gateway client is registered; subsequent sandbox clients are handled by the interceptor.
+The `configure-fgap.sh` script is retained as a fallback for environments where the interceptor does not have the `manage-authorization` role, or for initial bootstrapping of pre-existing clients.
 
 ## Summary of required roles
 

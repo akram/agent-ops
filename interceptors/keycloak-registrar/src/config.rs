@@ -62,12 +62,6 @@ impl Config {
                     .filter(|scope| !scope.is_empty())
                     .map(str::to_string)
                     .collect(),
-                audience_clients: optional("AUDIENCE_CLIENTS", "")
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|c| !c.is_empty())
-                    .map(str::to_string)
-                    .collect(),
             },
         })
     }

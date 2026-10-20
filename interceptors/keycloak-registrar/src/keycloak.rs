@@ -29,10 +29,6 @@ pub struct KeycloakConfig {
     /// Client scopes (by name) every sandbox client gets as default scopes,
     /// typically one audience scope per target API.
     pub default_scopes: Vec<String>,
-    /// Client IDs of the audience services that sandbox clients may exchange
-    /// tokens to. When FGAP v1 is active, the interceptor configures
-    /// token-exchange scope permissions on these clients for each sandbox.
-    pub audience_clients: Vec<String>,
 }
 
 pub struct KeycloakAdmin {
@@ -209,14 +205,14 @@ impl KeycloakAdmin {
         sandbox_uuid: &str,
         _spiffe_id: &str,
     ) -> Result<(), String> {
-        if self.config.audience_clients.is_empty() {
+        if self.config.default_scopes.is_empty() {
             return Ok(());
         }
 
-        let realm_mgmt = self
-            .client_uuid("realm-management")
-            .await?
-            .ok_or("realm-management client not found")?;
+        let realm_mgmt = match self.client_uuid("realm-management").await? {
+            Some(uuid) => uuid,
+            None => return Ok(()),
+        };
 
         let tx_scope_id = self.token_exchange_scope_id(&realm_mgmt).await?;
         let tx_scope_id = match tx_scope_id {
@@ -254,8 +250,8 @@ impl KeycloakAdmin {
         // Each needs management permissions enabled and a token-exchange
         // scope permission that includes both participant policies.
         let mut targets: Vec<String> = vec![];
-        for audience_client_id in &self.config.audience_clients {
-            if let Some(uuid) = self.client_uuid(audience_client_id).await? {
+        for scope_name in &self.config.default_scopes {
+            if let Some(uuid) = self.client_uuid(scope_name).await? {
                 targets.push(uuid);
             }
         }
@@ -793,7 +789,6 @@ mod tests {
             identity_provider: "spiffe".to_string(),
             gateway_client_id: GATEWAY.to_string(),
             default_scopes: vec!["alpha-svc".to_string()],
-            audience_clients: vec![],
         });
         (admin, state)
     }
@@ -919,7 +914,6 @@ mod tests {
             identity_provider: "spiffe".to_string(),
             gateway_client_id: GATEWAY.to_string(),
             default_scopes: vec![],
-            audience_clients: vec![],
         });
         let err = admin.ensure_sandbox(SANDBOX).await.unwrap_err();
         assert!(err.contains("401"), "{err}");
