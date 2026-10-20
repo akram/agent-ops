@@ -231,15 +231,43 @@ impl KeycloakAdmin {
                 format!("gateway client {:?} not found", self.config.gateway_client_id)
             })?;
 
-        for audience_client_id in &self.config.audience_clients {
-            let audience_uuid = match self.client_uuid(audience_client_id).await? {
-                Some(uuid) => uuid,
-                None => continue,
-            };
+        // Create policies for both participants
+        let sandbox_policy_name = format!(
+            "sandbox-exchange-{}",
+            &sandbox_uuid[..8.min(sandbox_uuid.len())]
+        );
+        let sandbox_policy_id = self
+            .ensure_client_policy(&realm_mgmt, &sandbox_policy_name, sandbox_uuid)
+            .await?;
 
+        let gateway_policy_name = format!(
+            "gateway-exchange-{}",
+            &gateway_uuid[..8.min(gateway_uuid.len())]
+        );
+        let gateway_policy_id = self
+            .ensure_client_policy(&realm_mgmt, &gateway_policy_name, &gateway_uuid)
+            .await?;
+
+        let participant_policies = [sandbox_policy_id, gateway_policy_id];
+
+        // Build list of all targets: audience clients + sandbox + gateway.
+        // Each needs management permissions enabled and a token-exchange
+        // scope permission that includes both participant policies.
+        let mut targets: Vec<String> = vec![];
+        for audience_client_id in &self.config.audience_clients {
+            if let Some(uuid) = self.client_uuid(audience_client_id).await? {
+                targets.push(uuid);
+            }
+        }
+        targets.push(sandbox_uuid.to_string());
+        if !targets.contains(&gateway_uuid) {
+            targets.push(gateway_uuid.clone());
+        }
+
+        for target_uuid in &targets {
             self.admin(
                 Method::PUT,
-                &format!("/clients/{audience_uuid}/management/permissions"),
+                &format!("/clients/{target_uuid}/management/permissions"),
                 Some(&json!({"enabled": true})),
             )
             .await?;
@@ -247,40 +275,22 @@ impl KeycloakAdmin {
             let mgmt_info = self
                 .admin(
                     Method::GET,
-                    &format!("/clients/{audience_uuid}/management/permissions"),
+                    &format!("/clients/{target_uuid}/management/permissions"),
                     None,
                 )
                 .await?;
-            let tx_perm_id = mgmt_info["scopePermissions"]["token-exchange"]
-                .as_str()
-                .ok_or_else(|| {
-                    format!("no token-exchange permission on audience {audience_client_id}")
-                })?
-                .to_string();
+            let tx_perm_id = match mgmt_info["scopePermissions"]["token-exchange"].as_str() {
+                Some(id) => id.to_string(),
+                None => continue,
+            };
             let resource_id = mgmt_info["resource"]
                 .as_str()
                 .unwrap_or("")
                 .to_string();
 
-            let sandbox_policy_name = format!(
-                "sandbox-exchange-{}",
-                &sandbox_uuid[..8.min(sandbox_uuid.len())]
-            );
-            let sandbox_policy_id = self
-                .ensure_client_policy(&realm_mgmt, &sandbox_policy_name, sandbox_uuid)
-                .await?;
-
-            let gateway_policy_name = format!(
-                "gateway-exchange-{}",
-                &gateway_uuid[..8.min(gateway_uuid.len())]
-            );
-            let gateway_policy_id = self
-                .ensure_client_policy(&realm_mgmt, &gateway_policy_name, &gateway_uuid)
-                .await?;
-
-            let existing_policies = self.permission_policy_ids(&realm_mgmt, &tx_perm_id).await?;
-            let mut all_policies = existing_policies;
-            for id in [&sandbox_policy_id, &gateway_policy_id] {
+            let existing = self.permission_policy_ids(&realm_mgmt, &tx_perm_id).await?;
+            let mut all_policies = existing;
+            for id in &participant_policies {
                 if !all_policies.contains(id) {
                     all_policies.push(id.clone());
                 }
@@ -288,7 +298,7 @@ impl KeycloakAdmin {
 
             let perm_body = json!({
                 "id": tx_perm_id,
-                "name": format!("token-exchange.permission.client.{audience_uuid}"),
+                "name": format!("token-exchange.permission.client.{target_uuid}"),
                 "type": "scope",
                 "logic": "POSITIVE",
                 "decisionStrategy": "AFFIRMATIVE",
