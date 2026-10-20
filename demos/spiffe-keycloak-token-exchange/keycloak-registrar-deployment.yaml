@@ -1,0 +1,72 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-registrar
+  namespace: openshell
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: keycloak-registrar-tls
+spec:
+  selector:
+    app: keycloak-registrar
+  ports:
+    - name: grpc
+      port: 8443
+      targetPort: 8443
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak-registrar
+  namespace: openshell
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak-registrar
+  template:
+    metadata:
+      labels:
+        app: keycloak-registrar
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: interceptor
+          image: image-registry.openshift-image-registry.svc:5000/openshell/keycloak-registrar:latest
+          env:
+            - {name: TLS_CERT_FILE, value: /tls/tls.crt}
+            - {name: TLS_KEY_FILE, value: /tls/tls.key}
+            - {name: GATEWAY_PUBLIC_KEY_FILE, value: /gateway/public.pem}
+            - {name: GATEWAY_ID, value: openshell}
+            - {name: SPIFFE_TRUST_DOMAIN, value: "spiffe://openshell.local"}
+            - name: SANDBOX_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - {name: KEYCLOAK_URL, value: "https://sso.apps.cluster-tlszf.dyn.redhatworkshops.io"}
+            - {name: KEYCLOAK_REALM, value: openshell}
+            - {name: KEYCLOAK_IDENTITY_PROVIDER, value: spire-spiffe}
+            - {name: GATEWAY_CLIENT_ID, value: "spiffe://openshell.local/ns/openshell/sa/openshell"}
+            - {name: DEFAULT_CLIENT_SCOPES, value: "model-api"}
+          envFrom:
+            - secretRef:
+                name: keycloak-registrar-keycloak
+          ports:
+            - containerPort: 8443
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+            runAsNonRoot: true
+            seccompProfile: {type: RuntimeDefault}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 128Mi}
+          volumeMounts:
+            - {name: tls, mountPath: /tls, readOnly: true}
+            - {name: gateway-key, mountPath: /gateway, readOnly: true}
+      volumes:
+        - name: tls
+          secret:
+            secretName: keycloak-registrar-tls
+        - name: gateway-key
+          secret:
+            secretName: openshell-jwt-keys
+            items:
+              - {key: public.pem, path: public.pem}

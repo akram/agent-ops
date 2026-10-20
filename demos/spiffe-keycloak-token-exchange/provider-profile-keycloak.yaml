@@ -1,0 +1,41 @@
+id: spiffe-keycloak-model-api
+display_name: SPIFFE + Keycloak Model API
+description: Model API access with user identity delegation via Keycloak RFC 8693 token exchange
+category: other
+credentials:
+  - name: subject_token
+    description: User OIDC token from Keycloak
+    required: true
+  - name: access_token
+    description: Access token via RFC 8693 token exchange through Keycloak
+    required: false
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      grant_type: token_exchange
+      token_endpoint: https://sso.apps.cluster-tlszf.dyn.redhatworkshops.io/realms/openshell/protocol/openid-connect/token
+      audience: model-api
+      jwt_svid_audience: https://sso.apps.cluster-tlszf.dyn.redhatworkshops.io/realms/openshell
+      client_assertion_type: urn:ietf:params:oauth:client-assertion-type:jwt-spiffe
+      scopes: [completions]
+      cache_ttl_seconds: 60
+      subject_token:
+        source: provider_credential
+        credential: subject_token
+        subject_token_type: urn:ietf:params:oauth:token-type:access_token
+      audience_overrides:
+        - host: model-api.openshell-demo.svc.cluster.local
+          port: 80
+          audience: model-api
+          scopes: [completions]
+endpoints:
+  - host: model-api.openshell-demo.svc.cluster.local
+    port: 80
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries:
+  - /usr/bin/curl
+  - /usr/local/bin/curl
+  - /tmp/curl
+  - /usr/bin/python3

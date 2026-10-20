@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-api
+  namespace: openshell-demo
+  labels:
+    app: model-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: model-api
+  template:
+    metadata:
+      labels:
+        app: model-api
+    spec:
+      containers:
+        - name: model-api
+          image: node:22-alpine
+          command: ["node", "/demo/model-api.js"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: EXPECTED_AUDIENCE
+              value: "model-api"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          volumeMounts:
+            - name: scripts
+              mountPath: /demo
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: model-api-scripts
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: model-api
+  namespace: openshell-demo
+spec:
+  selector:
+    app: model-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
