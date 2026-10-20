@@ -224,6 +224,13 @@ impl KeycloakAdmin {
             None => return Ok(()),
         };
 
+        let gateway_uuid = self
+            .client_uuid(&self.config.gateway_client_id)
+            .await?
+            .ok_or_else(|| {
+                format!("gateway client {:?} not found", self.config.gateway_client_id)
+            })?;
+
         for audience_client_id in &self.config.audience_clients {
             let audience_uuid = match self.client_uuid(audience_client_id).await? {
                 Some(uuid) => uuid,
@@ -255,10 +262,29 @@ impl KeycloakAdmin {
                 .unwrap_or("")
                 .to_string();
 
-            let policy_name = format!("sandbox-exchange-{}", &sandbox_uuid[..8.min(sandbox_uuid.len())]);
-            let policy_id = self
-                .ensure_client_policy(&realm_mgmt, &policy_name, sandbox_uuid)
+            let sandbox_policy_name = format!(
+                "sandbox-exchange-{}",
+                &sandbox_uuid[..8.min(sandbox_uuid.len())]
+            );
+            let sandbox_policy_id = self
+                .ensure_client_policy(&realm_mgmt, &sandbox_policy_name, sandbox_uuid)
                 .await?;
+
+            let gateway_policy_name = format!(
+                "gateway-exchange-{}",
+                &gateway_uuid[..8.min(gateway_uuid.len())]
+            );
+            let gateway_policy_id = self
+                .ensure_client_policy(&realm_mgmt, &gateway_policy_name, &gateway_uuid)
+                .await?;
+
+            let existing_policies = self.permission_policy_ids(&realm_mgmt, &tx_perm_id).await?;
+            let mut all_policies = existing_policies;
+            for id in [&sandbox_policy_id, &gateway_policy_id] {
+                if !all_policies.contains(id) {
+                    all_policies.push(id.clone());
+                }
+            }
 
             let perm_body = json!({
                 "id": tx_perm_id,
@@ -268,7 +294,7 @@ impl KeycloakAdmin {
                 "decisionStrategy": "AFFIRMATIVE",
                 "resources": [resource_id],
                 "scopes": [tx_scope_id],
-                "policies": [policy_id],
+                "policies": all_policies,
             });
             self.admin(
                 Method::PUT,
@@ -280,6 +306,33 @@ impl KeycloakAdmin {
             .await?;
         }
         Ok(())
+    }
+
+    async fn permission_policy_ids(
+        &self,
+        realm_mgmt_uuid: &str,
+        perm_id: &str,
+    ) -> Result<Vec<String>, String> {
+        let perm = self
+            .admin(
+                Method::GET,
+                &format!(
+                    "/clients/{realm_mgmt_uuid}/authz/resource-server/policy/{perm_id}/associatedPolicies"
+                ),
+                None,
+            )
+            .await;
+        match perm {
+            Ok(val) => Ok(val
+                .as_array()
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|p| p["id"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()),
+            Err(_) => Ok(vec![]),
+        }
     }
 
     async fn token_exchange_scope_id(
