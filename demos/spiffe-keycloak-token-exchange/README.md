@@ -2,9 +2,13 @@
 
 End-to-end demo of workload identity with user delegation on OpenShift, using SPIFFE/SPIRE + Red Hat Build of Keycloak + OpenShell.
 
-## Recording
+## Recordings
 
+**6 security scenarios** (token exchange flow, rejections, multi-user):
 [![asciicast](https://asciinema.org/a/tETTOnFHnUFyYLSL.svg)](https://asciinema.org/a/tETTOnFHnUFyYLSL)
+
+**Automated FGAP** (zero-config: sandbox create → interceptor → FGAP → exchange):
+[![asciicast](https://asciinema.org/a/wUwNJCreRCZtifEI.svg)](https://asciinema.org/a/wUwNJCreRCZtifEI)
 
 ## What it demonstrates
 
@@ -40,7 +44,8 @@ The sandbox process never sees any token; the supervisor injects `Authorization:
 
 | File | Description |
 |------|-------------|
-| `record.sh` | Asciinema recording script (160 cols, ~95s) |
+| `record.sh` | Asciinema recording script: 6 security scenarios (160 cols, ~95s) |
+| `record-automated-fgap.sh` | Asciinema recording script: automated FGAP demo (160 cols, ~120s) |
 | `model-api.js` | Mock model API (Node.js) that validates bearer tokens and returns identity claims |
 | `model-api-deployment.yaml` | Kubernetes deployment for the mock model API |
 | `provider-profile-keycloak.yaml` | OpenShell provider profile for SPIFFE + Keycloak token exchange |
