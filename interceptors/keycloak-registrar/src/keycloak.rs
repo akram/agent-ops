@@ -29,6 +29,10 @@ pub struct KeycloakConfig {
     /// Client scopes (by name) every sandbox client gets as default scopes,
     /// typically one audience scope per target API.
     pub default_scopes: Vec<String>,
+    /// Client IDs of the audience services that sandbox clients may exchange
+    /// tokens to. When FGAP v1 is active, the interceptor configures
+    /// token-exchange scope permissions on these clients for each sandbox.
+    pub audience_clients: Vec<String>,
 }
 
 pub struct KeycloakAdmin {
@@ -121,6 +125,8 @@ impl KeycloakAdmin {
             None,
         )
         .await?;
+
+        self.ensure_fgap_permissions(&client, spiffe_id).await?;
         Ok(())
     }
 
@@ -190,6 +196,155 @@ impl KeycloakAdmin {
             .await?;
         }
         Ok(scope)
+    }
+
+    /// Configures FGAP v1 token-exchange permissions so this sandbox client
+    /// can exchange tokens to each configured audience client.
+    ///
+    /// When the `admin-fine-grained-authz:v1` feature is active on the realm,
+    /// `standard.token.exchange.enabled` is ignored; permissions must be set
+    /// explicitly on the realm-management authorization server.
+    async fn ensure_fgap_permissions(
+        &self,
+        sandbox_uuid: &str,
+        _spiffe_id: &str,
+    ) -> Result<(), String> {
+        if self.config.audience_clients.is_empty() {
+            return Ok(());
+        }
+
+        let realm_mgmt = self
+            .client_uuid("realm-management")
+            .await?
+            .ok_or("realm-management client not found")?;
+
+        let tx_scope_id = self.token_exchange_scope_id(&realm_mgmt).await?;
+        let tx_scope_id = match tx_scope_id {
+            Some(id) => id,
+            None => return Ok(()),
+        };
+
+        for audience_client_id in &self.config.audience_clients {
+            let audience_uuid = match self.client_uuid(audience_client_id).await? {
+                Some(uuid) => uuid,
+                None => continue,
+            };
+
+            self.admin(
+                Method::PUT,
+                &format!("/clients/{audience_uuid}/management/permissions"),
+                Some(&json!({"enabled": true})),
+            )
+            .await?;
+
+            let mgmt_info = self
+                .admin(
+                    Method::GET,
+                    &format!("/clients/{audience_uuid}/management/permissions"),
+                    None,
+                )
+                .await?;
+            let tx_perm_id = mgmt_info["scopePermissions"]["token-exchange"]
+                .as_str()
+                .ok_or_else(|| {
+                    format!("no token-exchange permission on audience {audience_client_id}")
+                })?
+                .to_string();
+            let resource_id = mgmt_info["resource"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+
+            let policy_name = format!("sandbox-exchange-{}", &sandbox_uuid[..8.min(sandbox_uuid.len())]);
+            let policy_id = self
+                .ensure_client_policy(&realm_mgmt, &policy_name, sandbox_uuid)
+                .await?;
+
+            let perm_body = json!({
+                "id": tx_perm_id,
+                "name": format!("token-exchange.permission.client.{audience_uuid}"),
+                "type": "scope",
+                "logic": "POSITIVE",
+                "decisionStrategy": "AFFIRMATIVE",
+                "resources": [resource_id],
+                "scopes": [tx_scope_id],
+                "policies": [policy_id],
+            });
+            self.admin(
+                Method::PUT,
+                &format!(
+                    "/clients/{realm_mgmt}/authz/resource-server/permission/scope/{tx_perm_id}"
+                ),
+                Some(&perm_body),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn token_exchange_scope_id(
+        &self,
+        realm_mgmt_uuid: &str,
+    ) -> Result<Option<String>, String> {
+        let scopes = self
+            .admin(
+                Method::GET,
+                &format!(
+                    "/clients/{realm_mgmt_uuid}/authz/resource-server/scope?name=token-exchange"
+                ),
+                None,
+            )
+            .await?;
+        Ok(scopes
+            .as_array()
+            .and_then(|list| list.first())
+            .and_then(|s| s["id"].as_str())
+            .map(str::to_string))
+    }
+
+    async fn ensure_client_policy(
+        &self,
+        realm_mgmt_uuid: &str,
+        policy_name: &str,
+        client_uuid: &str,
+    ) -> Result<String, String> {
+        let body = json!({
+            "name": policy_name,
+            "type": "client",
+            "logic": "POSITIVE",
+            "decisionStrategy": "UNANIMOUS",
+            "clients": [client_uuid],
+        });
+        let result = self
+            .admin(
+                Method::POST,
+                &format!("/clients/{realm_mgmt_uuid}/authz/resource-server/policy/client"),
+                Some(&body),
+            )
+            .await;
+        match result {
+            Ok(val) if val["id"].is_string() => {
+                Ok(val["id"].as_str().unwrap().to_string())
+            }
+            Ok(_) | Err(_) => {
+                let existing = self
+                    .admin(
+                        Method::GET,
+                        &format!(
+                            "/clients/{realm_mgmt_uuid}/authz/resource-server/policy?name={}",
+                            urlencode(policy_name)
+                        ),
+                        None,
+                    )
+                    .await?;
+                existing
+                    .as_array()
+                    .and_then(|list| list.first())
+                    .and_then(|p| p["id"].as_str())
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("failed to create or find policy {policy_name}"))
+            }
+        }
     }
 
     async fn client_uuid(&self, client_id: &str) -> Result<Option<String>, String> {
@@ -575,6 +730,7 @@ mod tests {
             identity_provider: "spiffe".to_string(),
             gateway_client_id: GATEWAY.to_string(),
             default_scopes: vec!["alpha-svc".to_string()],
+            audience_clients: vec![],
         });
         (admin, state)
     }
@@ -700,6 +856,7 @@ mod tests {
             identity_provider: "spiffe".to_string(),
             gateway_client_id: GATEWAY.to_string(),
             default_scopes: vec![],
+            audience_clients: vec![],
         });
         let err = admin.ensure_sandbox(SANDBOX).await.unwrap_err();
         assert!(err.contains("401"), "{err}");
