@@ -22,7 +22,7 @@ use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
 use crate::auth::GatewayTokenVerifier;
-use crate::keycloak::KeycloakAdmin;
+use crate::keycloak::{KeycloakAdmin, SandboxMeta};
 use crate::spiffe::SpiffeIdTemplate;
 
 const SERVICE: &str = "openshell.v1.OpenShell";
@@ -33,14 +33,14 @@ const OUTCOME_ANNOTATION: &str = "keycloak_registrar.outcome";
 /// Registers and removes the Keycloak objects for one sandbox SPIFFE ID.
 #[tonic::async_trait]
 pub trait SandboxRegistrar: Send + Sync + 'static {
-    async fn ensure_sandbox(&self, spiffe_id: &str) -> Result<(), String>;
+    async fn ensure_sandbox(&self, spiffe_id: &str, meta: &SandboxMeta) -> Result<(), String>;
     async fn delete_sandbox(&self, spiffe_id: &str) -> Result<(), String>;
 }
 
 #[tonic::async_trait]
 impl SandboxRegistrar for KeycloakAdmin {
-    async fn ensure_sandbox(&self, spiffe_id: &str) -> Result<(), String> {
-        KeycloakAdmin::ensure_sandbox(self, spiffe_id).await
+    async fn ensure_sandbox(&self, spiffe_id: &str, meta: &SandboxMeta) -> Result<(), String> {
+        KeycloakAdmin::ensure_sandbox(self, spiffe_id, meta).await
     }
     async fn delete_sandbox(&self, spiffe_id: &str) -> Result<(), String> {
         KeycloakAdmin::delete_sandbox(self, spiffe_id).await
@@ -152,8 +152,20 @@ impl RegistrarService {
 
         let spiffe_id = self.template.render(&self.trust_domain, sandbox_id);
         let result = if creating {
+            let meta = SandboxMeta {
+                name: response
+                    .pointer("/sandbox/metadata/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                workspace: response
+                    .pointer("/sandbox/metadata/workspace")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            };
             self.registrar
-                .ensure_sandbox(&spiffe_id)
+                .ensure_sandbox(&spiffe_id, &meta)
                 .await
                 .map(|()| "registered")
         } else {
@@ -294,7 +306,7 @@ mod tests {
 
     #[tonic::async_trait]
     impl SandboxRegistrar for FakeRegistrar {
-        async fn ensure_sandbox(&self, spiffe_id: &str) -> Result<(), String> {
+        async fn ensure_sandbox(&self, spiffe_id: &str, _meta: &SandboxMeta) -> Result<(), String> {
             self.ensured.lock().unwrap().push(spiffe_id.to_string());
             if self.fail {
                 Err("keycloak unavailable".to_string())
