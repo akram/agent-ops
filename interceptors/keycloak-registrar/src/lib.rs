@@ -10,3 +10,4 @@ pub mod config;
 pub mod keycloak;
 pub mod service;
 pub mod spiffe;
+pub mod webhook;

@@ -11,6 +11,8 @@ rust-version = "1.94"
 license = "Apache-2.0"
 
 [dependencies]
+axum = "0.8"
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 openshell-core = { git = "https://github.com/NVIDIA/OpenShell", rev = "8719fc9f37a93dd96435cf6753ae53c8ee8809e6", default-features = false }
 openshell-extension-core = { git = "https://github.com/NVIDIA/OpenShell", rev = "8719fc9f37a93dd96435cf6753ae53c8ee8809e6" }

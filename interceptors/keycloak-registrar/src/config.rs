@@ -13,6 +13,9 @@ pub const DEFAULT_AUDIENCE: &str = "urn:openshell:extension:interceptor:keycloak
 #[derive(Debug, Clone)]
 pub struct Config {
     pub listen_addr: SocketAddr,
+    pub webhook_listen_addr: SocketAddr,
+    pub webhook_tls_cert_file: Option<PathBuf>,
+    pub webhook_tls_key_file: Option<PathBuf>,
     pub tls_cert_file: PathBuf,
     pub tls_key_file: PathBuf,
     /// Gateway Ed25519 public key (PEM) used to verify extension tokens.
@@ -37,10 +40,16 @@ impl Config {
         };
         let optional = |key: &str, default: &str| get(key).unwrap_or_else(|| default.to_string());
         let listen = optional("LISTEN_ADDR", "0.0.0.0:8443");
+        let webhook_listen = optional("WEBHOOK_LISTEN_ADDR", "0.0.0.0:8444");
         Ok(Self {
             listen_addr: listen
                 .parse()
                 .map_err(|e| format!("LISTEN_ADDR {listen:?}: {e}"))?,
+            webhook_listen_addr: webhook_listen
+                .parse()
+                .map_err(|e| format!("WEBHOOK_LISTEN_ADDR {webhook_listen:?}: {e}"))?,
+            webhook_tls_cert_file: get("WEBHOOK_TLS_CERT_FILE").map(PathBuf::from),
+            webhook_tls_key_file: get("WEBHOOK_TLS_KEY_FILE").map(PathBuf::from),
             tls_cert_file: required("TLS_CERT_FILE")?.into(),
             tls_key_file: required("TLS_KEY_FILE")?.into(),
             gateway_public_key_file: required("GATEWAY_PUBLIC_KEY_FILE")?.into(),
