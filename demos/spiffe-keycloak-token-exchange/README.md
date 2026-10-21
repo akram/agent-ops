@@ -10,6 +10,9 @@ End-to-end demo of workload identity with user delegation on OpenShift, using SP
 **Automated FGAP** (zero-config: sandbox create → interceptor → FGAP → exchange):
 [![asciicast](https://asciinema.org/a/X7avOsSS0gvH4ku6.svg)](https://asciinema.org/a/X7avOsSS0gvH4ku6)
 
+**Interceptor setup** (installation, Keycloak SA, RBAC roles, deployment):
+[![asciicast](https://asciinema.org/a/qYarBNuqGdEh6JJJ.svg)](https://asciinema.org/a/qYarBNuqGdEh6JJJ)
+
 ## What it demonstrates
 
 A two-stage RFC 8693 token exchange flow:
