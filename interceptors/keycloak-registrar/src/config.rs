@@ -71,6 +71,7 @@ impl Config {
                     .filter(|scope| !scope.is_empty())
                     .map(str::to_string)
                     .collect(),
+                policy_separator: optional("POLICY_NAME_SEPARATOR", " <-> "),
             },
         })
     }
