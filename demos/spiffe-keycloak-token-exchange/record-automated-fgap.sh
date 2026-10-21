@@ -4,7 +4,7 @@ set -uo pipefail
 KC_URL="${KEYCLOAK_URL:?Set KEYCLOAK_URL to your Keycloak route}"
 KC_ADMIN_USER="${KEYCLOAK_ADMIN_USER:?Set KEYCLOAK_ADMIN_USER}"
 KC_ADMIN_PASS="${KEYCLOAK_ADMIN_PASS:?Set KEYCLOAK_ADMIN_PASS}"
-REALM="${KEYCLOAK_REALM:-openshell}"
+REALM="openshell"
 GW="${OPENSHELL_GATEWAY:-http://127.0.0.1:8099}"
 OPENSHELL_CLI="${OPENSHELL_CLI:-openshell}"
 GATEWAY_NAME="${GATEWAY_NAME:-saw-cluster}"
@@ -48,7 +48,7 @@ sleep 2
 banner "Step 1: Check Keycloak clients BEFORE sandbox creation"
 
 ADMIN_TOKEN=$(kc_admin_token)
-echo -e "${C}> Listing federated-jwt clients in realm '$REALM':${O}"
+echo -e "  ${C}> curl -sk \$KC_URL/admin/realms/$REALM/clients | jq '.[] | select(.clientAuthenticatorType==\"federated-jwt\")'${O}"
 echo ""
 CLIENTS_BEFORE=$(curl -sk "$KC_URL/admin/realms/$REALM/clients?max=100" \
   -H "Authorization: Bearer $ADMIN_TOKEN" | jq '[.[] | select(.clientAuthenticatorType=="federated-jwt") | {clientId, id}]')
@@ -61,12 +61,14 @@ sleep 2
 # ═══════════════════════════════════════════════════════
 banner "Step 2: Check model-api FGAP permissions BEFORE"
 
+echo -e "  ${C}> curl -sk \$KC_URL/admin/realms/$REALM/clients/\$MODEL_API_UUID/management/permissions${O}"
+echo ""
 MODEL_UUID=$(curl -sk "$KC_URL/admin/realms/$REALM/clients?clientId=model-api" \
   -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.[0].id')
 MGMT_BEFORE=$(curl -sk "$KC_URL/admin/realms/$REALM/clients/$MODEL_UUID/management/permissions" \
   -H "Authorization: Bearer $ADMIN_TOKEN")
 TX_PERM_BEFORE=$(echo "$MGMT_BEFORE" | jq -r '.scopePermissions["token-exchange"] // "none"')
-echo -e "${C}> model-api management permissions:${O}"
+echo -e "${W}  model-api management permissions:${O}"
 echo -e "  ${D}enabled: $(echo "$MGMT_BEFORE" | jq -r '.enabled')${O}"
 echo -e "  ${D}token-exchange permission: ${TX_PERM_BEFORE}${O}"
 echo ""
@@ -77,7 +79,9 @@ if [ "$TX_PERM_BEFORE" != "none" ]; then
   POLICIES_BEFORE=$(curl -sk "$KC_URL/admin/realms/$REALM/clients/$RM_UUID/authz/resource-server/policy/$TX_PERM_BEFORE/associatedPolicies" \
     -H "Authorization: Bearer $ADMIN_TOKEN" 2>/dev/null)
   POLICY_COUNT=$(echo "$POLICIES_BEFORE" | jq 'length' 2>/dev/null || echo 0)
-  echo -e "${C}> Token-exchange policies on model-api:${O}"
+  echo -e "  ${C}> curl -sk \$KC_URL/admin/realms/$REALM/clients/\$RM_UUID/authz/resource-server/policy/\$PERM_ID/associatedPolicies${O}"
+  echo ""
+  echo -e "${W}  Token-exchange policies on model-api:${O}"
   echo "$POLICIES_BEFORE" | jq -r '.[] | "  \(.name)"' 2>/dev/null || echo "  (none)"
   echo ""
   echo -e "${W}  $POLICY_COUNT policies linked${O}"
@@ -101,6 +105,7 @@ echo ""
 
 echo -e "${G}  Sandbox created. Waiting for supervisor to initialize...${O}"
 sleep 5
+echo -e "  ${C}> os sandbox list${O}"
 os sandbox list 2>&1 | grep model-demo
 echo ""
 
@@ -128,7 +133,7 @@ sleep 2
 banner "Step 5: Check Keycloak clients AFTER sandbox creation"
 
 ADMIN_TOKEN=$(kc_admin_token)
-echo -e "${C}> Listing federated-jwt clients in realm '$REALM':${O}"
+echo -e "  ${C}> curl -sk \$KC_URL/admin/realms/$REALM/clients | jq '.[] | select(.clientAuthenticatorType==\"federated-jwt\")'${O}"
 echo ""
 CLIENTS_AFTER=$(curl -sk "$KC_URL/admin/realms/$REALM/clients?max=100" \
   -H "Authorization: Bearer $ADMIN_TOKEN" | jq '[.[] | select(.clientAuthenticatorType=="federated-jwt") | {clientId, id}]')
@@ -147,7 +152,8 @@ sleep 2
 banner "Step 6: Verify FGAP permissions AFTER"
 
 ADMIN_TOKEN=$(kc_admin_token)
-echo -e "${C}> model-api token-exchange policies:${O}"
+echo -e "  ${C}> curl -sk \$KC_URL/admin/realms/$REALM/clients/\$MODEL_API_UUID/management/permissions${O}"
+echo -e "  ${C}> curl -sk \$KC_URL/.../authz/resource-server/policy/\$PERM_ID/associatedPolicies${O}"
 echo ""
 MGMT_AFTER=$(curl -sk "$KC_URL/admin/realms/$REALM/clients/$MODEL_UUID/management/permissions" \
   -H "Authorization: Bearer $ADMIN_TOKEN")
@@ -162,7 +168,9 @@ echo ""
 echo -e "  ${G}✅ $POLICY_COUNT_AFTER policies linked (sandbox + gateway)${O}"
 echo ""
 
-echo -e "${C}> Sandbox management permissions:${O}"
+echo -e "  ${C}> curl -sk \$KC_URL/admin/realms/$REALM/clients/\$SANDBOX_UUID/management/permissions${O}"
+echo ""
+echo -e "${W}  Sandbox management permissions:${O}"
 SANDBOX_MGMT=$(curl -sk "$KC_URL/admin/realms/$REALM/clients/$NEW_UUID/management/permissions" \
   -H "Authorization: Bearer $ADMIN_TOKEN" 2>/dev/null)
 SANDBOX_FGAP=$(echo "$SANDBOX_MGMT" | jq -r '.enabled // false')
@@ -174,7 +182,9 @@ else
 fi
 echo ""
 
-echo -e "${C}> Gateway management permissions:${O}"
+echo -e "  ${C}> curl -sk \$KC_URL/admin/realms/$REALM/clients/\$GATEWAY_UUID/management/permissions${O}"
+echo ""
+echo -e "${W}  Gateway management permissions:${O}"
 GW_UUID=$(curl -sk "$KC_URL/admin/realms/$REALM/clients?clientId=$(python3 -c "import urllib.parse; print(urllib.parse.quote('spiffe://openshell.local/ns/openshell/sa/openshell'))")" \
   -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.[0].id')
 GW_MGMT=$(curl -sk "$KC_URL/admin/realms/$REALM/clients/$GW_UUID/management/permissions" \
@@ -192,6 +202,8 @@ sleep 2
 banner "Step 7: Token exchange test (zero manual config)"
 
 echo -e "${W}📌 Get Alice's token from Keycloak${O}"
+echo ""
+echo -e "  ${C}> curl -X POST \$KC_URL/realms/$REALM/protocol/openid-connect/token -d grant_type=password -d client_id=openshell-cli -d username=alice${O}"
 echo ""
 ALICE_TOKEN=$(curl -sk --max-time 10 -X POST "$KC_URL/realms/$REALM/protocol/openid-connect/token" \
   -d "grant_type=password" -d "client_id=openshell-cli" \
