@@ -29,6 +29,9 @@ pub struct KeycloakConfig {
     /// Client scopes (by name) every sandbox client gets as default scopes,
     /// typically one audience scope per target API.
     pub default_scopes: Vec<String>,
+    /// Separator in FGAP policy names between participant and audience,
+    /// e.g. `" <-> "` gives `sandbox/model-demo <-> model-api`.
+    pub policy_separator: String,
 }
 
 pub struct KeycloakAdmin {
@@ -134,7 +137,7 @@ impl KeycloakAdmin {
         let all_clients = self
             .admin(Method::GET, "/clients?max=200", None)
             .await?;
-        let sandbox_uuids: Vec<String> = all_clients
+        let sandboxes: Vec<(String, String)> = all_clients
             .as_array()
             .map(|clients| {
                 clients
@@ -145,13 +148,17 @@ impl KeycloakAdmin {
                             .as_str()
                             .is_some_and(|id| id.contains("/sandbox/"))
                     })
-                    .filter_map(|c| c["id"].as_str().map(str::to_string))
+                    .filter_map(|c| {
+                        let uuid = c["id"].as_str()?.to_string();
+                        let cid = c["clientId"].as_str()?.to_string();
+                        Some((uuid, cid))
+                    })
                     .collect()
             })
             .unwrap_or_default();
 
-        for uuid in &sandbox_uuids {
-            if let Err(e) = self.ensure_fgap_permissions(uuid, "").await {
+        for (uuid, client_id) in &sandboxes {
+            if let Err(e) = self.ensure_fgap_permissions(uuid, client_id).await {
                 tracing::warn!(%uuid, %e, "FGAP sync failed for sandbox");
             }
         }
@@ -263,7 +270,7 @@ impl KeycloakAdmin {
     /// When the `admin-fine-grained-authz:v1` feature is active on the realm,
     /// `standard.token.exchange.enabled` is ignored; permissions must be set
     /// explicitly on the realm-management authorization server.
-    async fn discover_audience_clients(&self) -> Result<Vec<String>, String> {
+    async fn discover_audience_clients(&self) -> Result<Vec<(String, String)>, String> {
         let all_clients = self
             .admin(Method::GET, "/clients?max=200", None)
             .await?;
@@ -287,8 +294,8 @@ impl KeycloakAdmin {
                     .as_str()
                     .is_some_and(|v| v == "true");
                 if has_exchange || has_marker {
-                    if let Some(uuid) = client["id"].as_str() {
-                        audiences.push(uuid.to_string());
+                    if let (Some(uuid), Some(cid)) = (client["id"].as_str(), client["clientId"].as_str()) {
+                        audiences.push((uuid.to_string(), cid.to_string()));
                     }
                 }
             }
@@ -299,7 +306,7 @@ impl KeycloakAdmin {
     async fn ensure_fgap_permissions(
         &self,
         sandbox_uuid: &str,
-        _spiffe_id: &str,
+        sandbox_client_id: &str,
     ) -> Result<(), String> {
         let realm_mgmt = match self.client_uuid("realm-management").await? {
             Some(uuid) => uuid,
@@ -312,42 +319,21 @@ impl KeycloakAdmin {
             None => return Ok(()),
         };
 
+        let gateway_client_id = &self.config.gateway_client_id;
         let gateway_uuid = self
-            .client_uuid(&self.config.gateway_client_id)
+            .client_uuid(gateway_client_id)
             .await?
-            .ok_or_else(|| {
-                format!("gateway client {:?} not found", self.config.gateway_client_id)
-            })?;
+            .ok_or_else(|| format!("gateway client {gateway_client_id:?} not found"))?;
 
-        // Create policies for both participants
-        let sandbox_policy_name = format!(
-            "sandbox-exchange-{}",
-            &sandbox_uuid[..8.min(sandbox_uuid.len())]
-        );
-        let sandbox_policy_id = self
-            .ensure_client_policy(&realm_mgmt, &sandbox_policy_name, sandbox_uuid)
-            .await?;
-
-        let gateway_policy_name = format!(
-            "gateway-exchange-{}",
-            &gateway_uuid[..8.min(gateway_uuid.len())]
-        );
-        let gateway_policy_id = self
-            .ensure_client_policy(&realm_mgmt, &gateway_policy_name, &gateway_uuid)
-            .await?;
-
-        let participant_policies = [sandbox_policy_id, gateway_policy_id];
-
-        // Discover audience clients: auto-detect from Keycloak attributes,
-        // fall back to DEFAULT_CLIENT_SCOPES if no clients have the marker.
+        // Discover audience clients (uuid, clientId pairs).
         let discovered = self.discover_audience_clients().await?;
-        let mut targets: Vec<String> = if !discovered.is_empty() {
+        let mut targets: Vec<(String, String)> = if !discovered.is_empty() {
             discovered
         } else {
             let mut from_scopes = vec![];
             for scope_name in &self.config.default_scopes {
                 if let Some(uuid) = self.client_uuid(scope_name).await? {
-                    from_scopes.push(uuid);
+                    from_scopes.push((uuid, scope_name.clone()));
                 }
             }
             from_scopes
@@ -356,12 +342,21 @@ impl KeycloakAdmin {
         if targets.is_empty() {
             return Ok(());
         }
-        targets.push(sandbox_uuid.to_string());
-        if !targets.contains(&gateway_uuid) {
-            targets.push(gateway_uuid.clone());
+
+        // Also enable FGAP on the sandbox and gateway themselves.
+        if !targets.iter().any(|(u, _)| u == sandbox_uuid) {
+            targets.push((sandbox_uuid.to_string(), sandbox_client_id.to_string()));
+        }
+        if !targets.iter().any(|(u, _)| u == &gateway_uuid) {
+            targets.push((gateway_uuid.clone(), gateway_client_id.clone()));
         }
 
-        for target_uuid in &targets {
+        let sep = &self.config.policy_separator;
+        let sandbox_short = shorten_client_id(sandbox_client_id);
+        let gateway_short = shorten_client_id(gateway_client_id);
+
+        // For each target, create per-pair policies and attach them.
+        for (target_uuid, target_client_id) in &targets {
             self.admin(
                 Method::PUT,
                 &format!("/clients/{target_uuid}/management/permissions"),
@@ -385,9 +380,24 @@ impl KeycloakAdmin {
                 .unwrap_or("")
                 .to_string();
 
+            let target_short = shorten_client_id(target_client_id);
+
+            // One policy per (participant, target) pair.
+            let sandbox_policy_name =
+                format!("sandbox/{sandbox_short}{sep}{target_short}");
+            let sandbox_policy_id = self
+                .ensure_client_policy(&realm_mgmt, &sandbox_policy_name, sandbox_uuid)
+                .await?;
+
+            let gateway_policy_name =
+                format!("gateway/{gateway_short}{sep}{target_short}");
+            let gateway_policy_id = self
+                .ensure_client_policy(&realm_mgmt, &gateway_policy_name, &gateway_uuid)
+                .await?;
+
             let existing = self.permission_policy_ids(&realm_mgmt, &tx_perm_id).await?;
             let mut all_policies = existing;
-            for id in &participant_policies {
+            for id in [&sandbox_policy_id, &gateway_policy_id] {
                 if !all_policies.contains(id) {
                     all_policies.push(id.clone());
                 }
@@ -611,6 +621,27 @@ impl KeycloakAdmin {
             Instant::now() + Duration::from_secs(token.expires_in),
         ));
         Ok(token.access_token)
+    }
+}
+
+/// Extract a short, human-readable identifier from a Keycloak clientId.
+///
+/// SPIFFE IDs like `spiffe://openshell.local/openshell/sandbox/c7a91a22-...`
+/// are shortened to the last path segment (truncated to 40 chars).
+/// Plain names like `model-api` are returned as-is.
+fn shorten_client_id(client_id: &str) -> String {
+    let raw = if let Some(path) = client_id.strip_prefix("spiffe://") {
+        path.rsplit('/').next().unwrap_or(path)
+    } else if let Some(rest) = client_id.strip_prefix("federated-jwt-spiffe://") {
+        rest.rsplit('/').next().unwrap_or(rest)
+    } else {
+        client_id
+    };
+    let max_len = 40;
+    if raw.len() > max_len {
+        raw[..max_len].to_string()
+    } else {
+        raw.to_string()
     }
 }
 
@@ -890,6 +921,7 @@ mod tests {
             identity_provider: "spiffe".to_string(),
             gateway_client_id: GATEWAY.to_string(),
             default_scopes: vec!["alpha-svc".to_string()],
+            policy_separator: " <-> ".to_string(),
         });
         (admin, state)
     }
@@ -1015,8 +1047,28 @@ mod tests {
             identity_provider: "spiffe".to_string(),
             gateway_client_id: GATEWAY.to_string(),
             default_scopes: vec![],
+            policy_separator: " <-> ".to_string(),
         });
         let err = admin.ensure_sandbox(SANDBOX).await.unwrap_err();
         assert!(err.contains("401"), "{err}");
+    }
+
+    #[test]
+    fn shorten_client_id_extracts_last_segment() {
+        assert_eq!(
+            shorten_client_id("spiffe://openshell.local/openshell/sandbox/c7a91a22-8fa0"),
+            "c7a91a22-8fa0"
+        );
+        assert_eq!(
+            shorten_client_id("spiffe://openshell.local/ns/openshell/sa/openshell"),
+            "openshell"
+        );
+        assert_eq!(shorten_client_id("model-api"), "model-api");
+        assert_eq!(
+            shorten_client_id("federated-jwt-spiffe://openshell.local/openshell/sandbox/abc"),
+            "abc"
+        );
+        let long = "a".repeat(50);
+        assert_eq!(shorten_client_id(&long).len(), 40);
     }
 }
