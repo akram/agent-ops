@@ -167,7 +167,11 @@ impl KeycloakAdmin {
 
     /// Creates a Keycloak client for an audience service (e.g. model-api)
     /// with the `openshell.audience` and `standard.token.exchange.enabled` markers.
-    pub async fn ensure_audience_client(&self, client_id: &str) -> Result<(), String> {
+    pub async fn ensure_audience_client(
+        &self,
+        client_id: &str,
+        namespace: &str,
+    ) -> Result<(), String> {
         if self.client_uuid(client_id).await?.is_some() {
             return Ok(());
         }
@@ -181,6 +185,7 @@ impl KeycloakAdmin {
             "attributes": {
                 "openshell.audience": "true",
                 "standard.token.exchange.enabled": "true",
+                "openshell.namespace": namespace,
             },
         });
         self.admin(Method::POST, "/clients", Some(&body)).await?;
@@ -270,7 +275,8 @@ impl KeycloakAdmin {
     /// When the `admin-fine-grained-authz:v1` feature is active on the realm,
     /// `standard.token.exchange.enabled` is ignored; permissions must be set
     /// explicitly on the realm-management authorization server.
-    async fn discover_audience_clients(&self) -> Result<Vec<(String, String)>, String> {
+    /// Returns `(uuid, clientId, namespace)` for each audience client.
+    async fn discover_audience_clients(&self) -> Result<Vec<(String, String, String)>, String> {
         let all_clients = self
             .admin(Method::GET, "/clients?max=200", None)
             .await?;
@@ -295,7 +301,11 @@ impl KeycloakAdmin {
                     .is_some_and(|v| v == "true");
                 if has_exchange || has_marker {
                     if let (Some(uuid), Some(cid)) = (client["id"].as_str(), client["clientId"].as_str()) {
-                        audiences.push((uuid.to_string(), cid.to_string()));
+                        let ns = client["attributes"]["openshell.namespace"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
+                        audiences.push((uuid.to_string(), cid.to_string(), ns));
                     }
                 }
             }
@@ -325,15 +335,15 @@ impl KeycloakAdmin {
             .await?
             .ok_or_else(|| format!("gateway client {gateway_client_id:?} not found"))?;
 
-        // Discover audience clients (uuid, clientId pairs).
+        // Discover audience clients (uuid, clientId, namespace).
         let discovered = self.discover_audience_clients().await?;
-        let mut targets: Vec<(String, String)> = if !discovered.is_empty() {
+        let mut targets: Vec<(String, String, String)> = if !discovered.is_empty() {
             discovered
         } else {
             let mut from_scopes = vec![];
             for scope_name in &self.config.default_scopes {
                 if let Some(uuid) = self.client_uuid(scope_name).await? {
-                    from_scopes.push((uuid, scope_name.clone()));
+                    from_scopes.push((uuid, scope_name.clone(), String::new()));
                 }
             }
             from_scopes
@@ -344,19 +354,19 @@ impl KeycloakAdmin {
         }
 
         // Also enable FGAP on the sandbox and gateway themselves.
-        if !targets.iter().any(|(u, _)| u == sandbox_uuid) {
-            targets.push((sandbox_uuid.to_string(), sandbox_client_id.to_string()));
+        if !targets.iter().any(|(u, _, _)| u == sandbox_uuid) {
+            targets.push((sandbox_uuid.to_string(), sandbox_client_id.to_string(), String::new()));
         }
-        if !targets.iter().any(|(u, _)| u == &gateway_uuid) {
-            targets.push((gateway_uuid.clone(), gateway_client_id.clone()));
+        if !targets.iter().any(|(u, _, _)| u == &gateway_uuid) {
+            targets.push((gateway_uuid.clone(), gateway_client_id.clone(), String::new()));
         }
 
         let sep = &self.config.policy_separator;
-        let sandbox_short = shorten_client_id(sandbox_client_id);
-        let gateway_short = shorten_client_id(gateway_client_id);
+        let sandbox_label = format_participant(sandbox_client_id);
+        let gateway_label = format_participant(gateway_client_id);
 
         // For each target, create per-pair policies and attach them.
-        for (target_uuid, target_client_id) in &targets {
+        for (target_uuid, target_client_id, target_ns) in &targets {
             self.admin(
                 Method::PUT,
                 &format!("/clients/{target_uuid}/management/permissions"),
@@ -380,17 +390,22 @@ impl KeycloakAdmin {
                 .unwrap_or("")
                 .to_string();
 
-            let target_short = shorten_client_id(target_client_id);
+            // Build target label: "ns/name" when namespace is known, else just clientId.
+            let target_label = if target_ns.is_empty() {
+                format_participant(target_client_id)
+            } else {
+                format!("{target_ns}/{target_client_id}")
+            };
 
             // One policy per (participant, target) pair.
             let sandbox_policy_name =
-                format!("sandbox/{sandbox_short}{sep}{target_short}");
+                format!("{sandbox_label}{sep}{target_label}");
             let sandbox_policy_id = self
                 .ensure_client_policy(&realm_mgmt, &sandbox_policy_name, sandbox_uuid)
                 .await?;
 
             let gateway_policy_name =
-                format!("gateway/{gateway_short}{sep}{target_short}");
+                format!("{gateway_label}{sep}{target_label}");
             let gateway_policy_id = self
                 .ensure_client_policy(&realm_mgmt, &gateway_policy_name, &gateway_uuid)
                 .await?;
@@ -624,25 +639,43 @@ impl KeycloakAdmin {
     }
 }
 
-/// Extract a short, human-readable identifier from a Keycloak clientId.
+/// Extract `ns/name` from a SPIFFE-based clientId, or return the raw name.
 ///
-/// SPIFFE IDs like `spiffe://openshell.local/openshell/sandbox/c7a91a22-...`
-/// are shortened to the last path segment (truncated to 40 chars).
-/// Plain names like `model-api` are returned as-is.
-fn shorten_client_id(client_id: &str) -> String {
-    let raw = if let Some(path) = client_id.strip_prefix("spiffe://") {
-        path.rsplit('/').next().unwrap_or(path)
-    } else if let Some(rest) = client_id.strip_prefix("federated-jwt-spiffe://") {
-        rest.rsplit('/').next().unwrap_or(rest)
-    } else {
-        client_id
-    };
-    let max_len = 40;
-    if raw.len() > max_len {
-        raw[..max_len].to_string()
-    } else {
-        raw.to_string()
+/// - `spiffe://trust/ns/openshell/sa/gw`      → `"openshell/gw"`
+/// - `spiffe://trust/openshell/sandbox/abc123` → `"openshell/abc123"`
+/// - `federated-jwt-spiffe://…`                → same after stripping prefix
+/// - `model-api`                               → `"model-api"`
+fn format_participant(client_id: &str) -> String {
+    let spiffe_path = client_id
+        .strip_prefix("federated-jwt-spiffe://")
+        .or_else(|| client_id.strip_prefix("spiffe://"));
+
+    if let Some(path) = spiffe_path {
+        // Strip the trust-domain (first segment after the scheme).
+        let after_domain = path.find('/').map(|i| &path[i + 1..]).unwrap_or(path);
+        let segments: Vec<&str> = after_domain.split('/').collect();
+
+        // spiffe://…/ns/<ns>/sa/<name>
+        if segments.len() >= 3 && segments[0] == "ns" {
+            let ns = segments[1];
+            let name = segments.last().unwrap();
+            return truncate(&format!("{ns}/{name}"), 60);
+        }
+        // spiffe://…/<ns>/sandbox/<name>
+        if segments.len() >= 3 && segments[1] == "sandbox" {
+            let ns = segments[0];
+            let name = segments[2];
+            return truncate(&format!("{ns}/{name}"), 60);
+        }
+        // Fallback: last segment
+        let last = segments.last().unwrap_or(&path);
+        return truncate(last, 60);
     }
+    truncate(client_id, 60)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() > max { s[..max].to_string() } else { s.to_string() }
 }
 
 fn urlencode(value: &str) -> String {
@@ -1054,21 +1087,21 @@ mod tests {
     }
 
     #[test]
-    fn shorten_client_id_extracts_last_segment() {
+    fn format_participant_extracts_ns_and_name() {
         assert_eq!(
-            shorten_client_id("spiffe://openshell.local/openshell/sandbox/c7a91a22-8fa0"),
-            "c7a91a22-8fa0"
+            format_participant("spiffe://openshell.local/openshell/sandbox/c7a91a22-8fa0"),
+            "openshell/c7a91a22-8fa0"
         );
         assert_eq!(
-            shorten_client_id("spiffe://openshell.local/ns/openshell/sa/openshell"),
-            "openshell"
+            format_participant("spiffe://openshell.local/ns/openshell/sa/openshell"),
+            "openshell/openshell"
         );
-        assert_eq!(shorten_client_id("model-api"), "model-api");
+        assert_eq!(format_participant("model-api"), "model-api");
         assert_eq!(
-            shorten_client_id("federated-jwt-spiffe://openshell.local/openshell/sandbox/abc"),
-            "abc"
+            format_participant("federated-jwt-spiffe://openshell.local/openshell/sandbox/abc"),
+            "openshell/abc"
         );
-        let long = "a".repeat(50);
-        assert_eq!(shorten_client_id(&long).len(), 40);
+        let long = "a".repeat(70);
+        assert_eq!(format_participant(&long).len(), 60);
     }
 }

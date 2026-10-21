@@ -60,7 +60,7 @@ struct ResponseStatus {
     message: String,
 }
 
-fn extract_audience_name(obj: &Value) -> Option<String> {
+fn extract_audience_info(obj: &Value) -> Option<(String, String)> {
     let metadata = obj.get("metadata")?;
     let has_label = metadata
         .get("labels")
@@ -75,8 +75,13 @@ fn extract_audience_name(obj: &Value) -> Option<String> {
     if !has_label && !has_annotation {
         return None;
     }
-    let name = metadata.get("name")?.as_str()?;
-    Some(name.to_string())
+    let name = metadata.get("name")?.as_str()?.to_string();
+    let namespace = metadata
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some((name, namespace))
 }
 
 fn allow(uid: &str) -> AdmissionResponse {
@@ -101,9 +106,9 @@ pub async fn handle_admission(
     match op {
         "CREATE" | "UPDATE" => {
             if let Some(obj) = &review.request.object {
-                if let Some(name) = extract_audience_name(obj) {
-                    info!(%name, "webhook: registering audience client");
-                    if let Err(e) = kc.ensure_audience_client(&name).await {
+                if let Some((name, namespace)) = extract_audience_info(obj) {
+                    info!(%name, %namespace, "webhook: registering audience client");
+                    if let Err(e) = kc.ensure_audience_client(&name, &namespace).await {
                         warn!(%name, %e, "webhook: failed to register audience client");
                     }
                     info!(%name, "webhook: syncing FGAP for existing sandboxes");
@@ -120,7 +125,7 @@ pub async fn handle_admission(
                 .as_ref()
                 .or(review.request.object.as_ref());
             if let Some(obj) = obj {
-                if let Some(name) = extract_audience_name(obj) {
+                if let Some((name, _namespace)) = extract_audience_info(obj) {
                     info!(%name, "webhook: deregistering audience client");
                     if let Err(e) = kc.delete_audience_client(&name).await {
                         warn!(%name, %e, "webhook: failed to deregister audience client");
