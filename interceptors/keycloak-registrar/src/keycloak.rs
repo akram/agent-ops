@@ -29,15 +29,27 @@ pub struct KeycloakConfig {
     /// Client scopes (by name) every sandbox client gets as default scopes,
     /// typically one audience scope per target API.
     pub default_scopes: Vec<String>,
-    /// Separator in FGAP policy names between participant and audience,
-    /// e.g. `" <-> "` gives `sandbox/model-demo <-> model-api`.
+    /// Separator in FGAP policy names between participant and audience.
     pub policy_separator: String,
+    /// Human-readable gateway name (from `GATEWAY_ID`), used in policy names.
+    pub gateway_name: String,
+    /// Format template for sandbox-side FGAP policy names.
+    pub policy_sandbox_fmt: String,
+    /// Format template for gateway-side FGAP policy names.
+    pub policy_gateway_fmt: String,
 }
 
 pub struct KeycloakAdmin {
     config: KeycloakConfig,
     http: reqwest::Client,
     token: Mutex<Option<(String, Instant)>>,
+}
+
+/// Metadata extracted from the gRPC CreateSandbox response.
+#[derive(Debug, Clone, Default)]
+pub struct SandboxMeta {
+    pub name: String,
+    pub workspace: String,
 }
 
 #[derive(Deserialize)]
@@ -63,7 +75,11 @@ impl KeycloakAdmin {
 
     /// Creates or updates the sandbox's federated client, its default scopes,
     /// and the audience scope that lets the gateway address tokens to it.
-    pub async fn ensure_sandbox(&self, spiffe_id: &str) -> Result<(), String> {
+    pub async fn ensure_sandbox(
+        &self,
+        spiffe_id: &str,
+        meta: &SandboxMeta,
+    ) -> Result<(), String> {
         let representation = json!({
             "clientId": spiffe_id,
             "protocol": "openid-connect",
@@ -76,6 +92,9 @@ impl KeycloakAdmin {
                 "jwt.credential.issuer": self.config.identity_provider,
                 "jwt.credential.sub": spiffe_id,
                 "standard.token.exchange.enabled": "true",
+                "openshell.sandbox-name": meta.name,
+                "openshell.workspace": meta.workspace,
+                "openshell.gateway": self.config.gateway_name,
             },
         });
         let client = match self.client_uuid(spiffe_id).await? {
@@ -125,7 +144,8 @@ impl KeycloakAdmin {
         )
         .await?;
 
-        self.ensure_fgap_permissions(&client, spiffe_id).await?;
+        self.ensure_fgap_permissions(&client, spiffe_id, meta)
+            .await?;
         Ok(())
     }
 
@@ -137,7 +157,7 @@ impl KeycloakAdmin {
         let all_clients = self
             .admin(Method::GET, "/clients?max=200", None)
             .await?;
-        let sandboxes: Vec<(String, String)> = all_clients
+        let sandboxes: Vec<(String, String, SandboxMeta)> = all_clients
             .as_array()
             .map(|clients| {
                 clients
@@ -151,14 +171,24 @@ impl KeycloakAdmin {
                     .filter_map(|c| {
                         let uuid = c["id"].as_str()?.to_string();
                         let cid = c["clientId"].as_str()?.to_string();
-                        Some((uuid, cid))
+                        let meta = SandboxMeta {
+                            name: c["attributes"]["openshell.sandbox-name"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string(),
+                            workspace: c["attributes"]["openshell.workspace"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string(),
+                        };
+                        Some((uuid, cid, meta))
                     })
                     .collect()
             })
             .unwrap_or_default();
 
-        for (uuid, client_id) in &sandboxes {
-            if let Err(e) = self.ensure_fgap_permissions(uuid, client_id).await {
+        for (uuid, client_id, meta) in &sandboxes {
+            if let Err(e) = self.ensure_fgap_permissions(uuid, client_id, meta).await {
                 tracing::warn!(%uuid, %e, "FGAP sync failed for sandbox");
             }
         }
@@ -317,6 +347,7 @@ impl KeycloakAdmin {
         &self,
         sandbox_uuid: &str,
         sandbox_client_id: &str,
+        meta: &SandboxMeta,
     ) -> Result<(), String> {
         let realm_mgmt = match self.client_uuid("realm-management").await? {
             Some(uuid) => uuid,
@@ -361,11 +392,12 @@ impl KeycloakAdmin {
             targets.push((gateway_uuid.clone(), gateway_client_id.clone(), String::new()));
         }
 
+        let gateway_id = &self.config.gateway_name;
+        let workspace = if meta.workspace.is_empty() { "default" } else { &meta.workspace };
+        let sandbox_name = if meta.name.is_empty() { &sandbox_uuid[..8.min(sandbox_uuid.len())] } else { &meta.name };
         let sep = &self.config.policy_separator;
-        let sandbox_label = format_participant(sandbox_client_id);
-        let gateway_label = format_participant(gateway_client_id);
+        let uuid8 = &sandbox_uuid[..8.min(sandbox_uuid.len())];
 
-        // For each target, create per-pair policies and attach them.
         for (target_uuid, target_client_id, target_ns) in &targets {
             self.admin(
                 Method::PUT,
@@ -390,22 +422,21 @@ impl KeycloakAdmin {
                 .unwrap_or("")
                 .to_string();
 
-            // Build target label: "ns/name" when namespace is known, else just clientId.
-            let target_label = if target_ns.is_empty() {
-                format_participant(target_client_id)
-            } else {
-                format!("{target_ns}/{target_client_id}")
-            };
-
-            // One policy per (participant, target) pair.
-            let sandbox_policy_name =
-                format!("{sandbox_label}{sep}{target_label}");
+            let v = [
+                ("{gateway_id}", gateway_id.as_str()),
+                ("{workspace}", workspace),
+                ("{sandbox_name}", sandbox_name),
+                ("{audience}", target_client_id.as_str()),
+                ("{audience_ns}", target_ns.as_str()),
+                ("{sep}", sep.as_str()),
+                ("{uuid8}", uuid8),
+            ];
+            let sandbox_policy_name = render_template(&self.config.policy_sandbox_fmt, &v);
             let sandbox_policy_id = self
                 .ensure_client_policy(&realm_mgmt, &sandbox_policy_name, sandbox_uuid)
                 .await?;
 
-            let gateway_policy_name =
-                format!("{gateway_label}{sep}{target_label}");
+            let gateway_policy_name = render_template(&self.config.policy_gateway_fmt, &v);
             let gateway_policy_id = self
                 .ensure_client_policy(&realm_mgmt, &gateway_policy_name, &gateway_uuid)
                 .await?;
@@ -639,43 +670,12 @@ impl KeycloakAdmin {
     }
 }
 
-/// Extract `ns/name` from a SPIFFE-based clientId, or return the raw name.
-///
-/// - `spiffe://trust/ns/openshell/sa/gw`      → `"openshell/gw"`
-/// - `spiffe://trust/openshell/sandbox/abc123` → `"openshell/abc123"`
-/// - `federated-jwt-spiffe://…`                → same after stripping prefix
-/// - `model-api`                               → `"model-api"`
-fn format_participant(client_id: &str) -> String {
-    let spiffe_path = client_id
-        .strip_prefix("federated-jwt-spiffe://")
-        .or_else(|| client_id.strip_prefix("spiffe://"));
-
-    if let Some(path) = spiffe_path {
-        // Strip the trust-domain (first segment after the scheme).
-        let after_domain = path.find('/').map(|i| &path[i + 1..]).unwrap_or(path);
-        let segments: Vec<&str> = after_domain.split('/').collect();
-
-        // spiffe://…/ns/<ns>/sa/<name>
-        if segments.len() >= 3 && segments[0] == "ns" {
-            let ns = segments[1];
-            let name = segments.last().unwrap();
-            return truncate(&format!("{ns}/{name}"), 60);
-        }
-        // spiffe://…/<ns>/sandbox/<name>
-        if segments.len() >= 3 && segments[1] == "sandbox" {
-            let ns = segments[0];
-            let name = segments[2];
-            return truncate(&format!("{ns}/{name}"), 60);
-        }
-        // Fallback: last segment
-        let last = segments.last().unwrap_or(&path);
-        return truncate(last, 60);
+fn render_template(template: &str, vars: &[(&str, &str)]) -> String {
+    let mut result = template.to_string();
+    for (key, value) in vars {
+        result = result.replace(key, value);
     }
-    truncate(client_id, 60)
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() > max { s[..max].to_string() } else { s.to_string() }
+    result
 }
 
 fn urlencode(value: &str) -> String {
@@ -955,14 +955,24 @@ mod tests {
             gateway_client_id: GATEWAY.to_string(),
             default_scopes: vec!["alpha-svc".to_string()],
             policy_separator: " <-> ".to_string(),
+            gateway_name: "test-gw".to_string(),
+            policy_sandbox_fmt: "os://{gateway_id}/workspaces/{workspace}/sandboxes/{sandbox_name}/supervisor{sep}k8s://{audience_ns}/{audience}".to_string(),
+            policy_gateway_fmt: "os://{gateway_id}/gateway{sep}k8s://{audience_ns}/{audience}".to_string(),
         });
         (admin, state)
+    }
+
+    fn test_meta() -> SandboxMeta {
+        SandboxMeta {
+            name: "agent-a".to_string(),
+            workspace: "default".to_string(),
+        }
     }
 
     #[tokio::test]
     async fn ensure_sandbox_creates_federated_client() {
         let (admin, state) = setup().await;
-        admin.ensure_sandbox(SANDBOX).await.unwrap();
+        admin.ensure_sandbox(SANDBOX, &test_meta()).await.unwrap();
 
         let realm = state.lock().unwrap();
         let (_, client) = realm.client_by_client_id(SANDBOX).expect("sandbox client");
@@ -979,7 +989,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_sandbox_attaches_target_scope_and_gateway_audience() {
         let (admin, state) = setup().await;
-        admin.ensure_sandbox(SANDBOX).await.unwrap();
+        admin.ensure_sandbox(SANDBOX, &test_meta()).await.unwrap();
 
         let realm = state.lock().unwrap();
         let (sandbox_id, _) = realm.client_by_client_id(SANDBOX).unwrap();
@@ -1001,8 +1011,8 @@ mod tests {
     #[tokio::test]
     async fn ensure_sandbox_is_idempotent() {
         let (admin, state) = setup().await;
-        admin.ensure_sandbox(SANDBOX).await.unwrap();
-        admin.ensure_sandbox(SANDBOX).await.unwrap();
+        admin.ensure_sandbox(SANDBOX, &test_meta()).await.unwrap();
+        admin.ensure_sandbox(SANDBOX, &test_meta()).await.unwrap();
 
         let realm = state.lock().unwrap();
         let sandbox_clients = realm
@@ -1028,7 +1038,7 @@ mod tests {
     #[tokio::test]
     async fn admin_token_uses_client_credentials_and_is_cached() {
         let (admin, state) = setup().await;
-        admin.ensure_sandbox(SANDBOX).await.unwrap();
+        admin.ensure_sandbox(SANDBOX, &test_meta()).await.unwrap();
         admin.delete_sandbox(SANDBOX).await.unwrap();
 
         let realm = state.lock().unwrap();
@@ -1041,7 +1051,7 @@ mod tests {
     #[tokio::test]
     async fn delete_sandbox_removes_client_scope_and_gateway_link() {
         let (admin, state) = setup().await;
-        admin.ensure_sandbox(SANDBOX).await.unwrap();
+        admin.ensure_sandbox(SANDBOX, &test_meta()).await.unwrap();
         admin.delete_sandbox(SANDBOX).await.unwrap();
 
         let realm = state.lock().unwrap();
@@ -1065,7 +1075,7 @@ mod tests {
     async fn missing_default_scope_is_an_error() {
         let (admin, state) = setup().await;
         state.lock().unwrap().scopes.clear();
-        let err = admin.ensure_sandbox(SANDBOX).await.unwrap_err();
+        let err = admin.ensure_sandbox(SANDBOX, &test_meta()).await.unwrap_err();
         assert!(err.contains("alpha-svc"), "{err}");
     }
 
@@ -1081,27 +1091,39 @@ mod tests {
             gateway_client_id: GATEWAY.to_string(),
             default_scopes: vec![],
             policy_separator: " <-> ".to_string(),
+            gateway_name: "test-gw".to_string(),
+            policy_sandbox_fmt: "{sandbox_name}".to_string(),
+            policy_gateway_fmt: "{gateway_id}".to_string(),
         });
-        let err = admin.ensure_sandbox(SANDBOX).await.unwrap_err();
+        let err = admin.ensure_sandbox(SANDBOX, &test_meta()).await.unwrap_err();
         assert!(err.contains("401"), "{err}");
     }
 
     #[test]
-    fn format_participant_extracts_ns_and_name() {
+    fn render_template_replaces_all_variables() {
+        let vars = [
+            ("{gateway_id}", "saw-cluster"),
+            ("{workspace}", "default"),
+            ("{sandbox_name}", "model-demo"),
+            ("{audience}", "model-api"),
+            ("{audience_ns}", "openshell-demo"),
+            ("{sep}", " <-> "),
+            ("{uuid8}", "c7a91a22"),
+        ];
         assert_eq!(
-            format_participant("spiffe://openshell.local/openshell/sandbox/c7a91a22-8fa0"),
-            "openshell/c7a91a22-8fa0"
+            render_template(
+                "os://{gateway_id}/workspaces/{workspace}/sandboxes/{sandbox_name}/supervisor{sep}k8s://{audience_ns}/{audience}",
+                &vars,
+            ),
+            "os://saw-cluster/workspaces/default/sandboxes/model-demo/supervisor <-> k8s://openshell-demo/model-api"
         );
         assert_eq!(
-            format_participant("spiffe://openshell.local/ns/openshell/sa/openshell"),
-            "openshell/openshell"
+            render_template("os://{gateway_id}/gateway{sep}k8s://{audience_ns}/{audience}", &vars),
+            "os://saw-cluster/gateway <-> k8s://openshell-demo/model-api"
         );
-        assert_eq!(format_participant("model-api"), "model-api");
         assert_eq!(
-            format_participant("federated-jwt-spiffe://openshell.local/openshell/sandbox/abc"),
-            "openshell/abc"
+            render_template("sandbox({uuid8}){sep}audience({audience})", &vars),
+            "sandbox(c7a91a22) <-> audience(model-api)"
         );
-        let long = "a".repeat(70);
-        assert_eq!(format_participant(&long).len(), 60);
     }
 }

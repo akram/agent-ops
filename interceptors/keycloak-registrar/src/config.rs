@@ -72,6 +72,15 @@ impl Config {
                     .map(str::to_string)
                     .collect(),
                 policy_separator: optional("POLICY_NAME_SEPARATOR", " <-> "),
+                gateway_name: required("GATEWAY_ID")?,
+                policy_sandbox_fmt: optional(
+                    "POLICY_NAME_SANDBOX_FMT",
+                    "os://{gateway_id}/workspaces/{workspace}/sandboxes/{sandbox_name}/supervisor{sep}k8s://{audience_ns}/{audience}",
+                ),
+                policy_gateway_fmt: optional(
+                    "POLICY_NAME_GATEWAY_FMT",
+                    "os://{gateway_id}/gateway{sep}k8s://{audience_ns}/{audience}",
+                ),
             },
         })
     }
