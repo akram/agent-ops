@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-registrar-webhook
+  namespace: openshell
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: keycloak-registrar-webhook-tls
+spec:
+  selector:
+    app: keycloak-registrar
+  ports:
+    - name: webhook
+      port: 443
+      targetPort: 8444
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: keycloak-registrar-audience
+  annotations:
+    service.beta.openshift.io/inject-cabundle: "true"
+webhooks:
+  - name: audience.keycloak-registrar.openshell.svc
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Ignore
+    matchPolicy: Equivalent
+    clientConfig:
+      service:
+        name: keycloak-registrar-webhook
+        namespace: openshell
+        path: /webhook/audience
+        port: 443
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["services"]
+        scope: "Namespaced"
+    objectSelector:
+      matchExpressions:
+        - key: openshell.ai/audience
+          operator: In
+          values: ["true"]

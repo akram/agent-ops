@@ -126,6 +126,69 @@ impl KeycloakAdmin {
         Ok(())
     }
 
+    /// Re-syncs FGAP permissions for all existing sandbox clients.
+    /// Called when a new audience client is added via the webhook, so that
+    /// existing sandboxes can exchange tokens to the new audience without
+    /// being recreated.
+    pub async fn sync_fgap_all_sandboxes(&self) -> Result<(), String> {
+        let all_clients = self
+            .admin(Method::GET, "/clients?max=200", None)
+            .await?;
+        let sandbox_uuids: Vec<String> = all_clients
+            .as_array()
+            .map(|clients| {
+                clients
+                    .iter()
+                    .filter(|c| c["clientAuthenticatorType"] == "federated-jwt")
+                    .filter(|c| {
+                        c["clientId"]
+                            .as_str()
+                            .is_some_and(|id| id.contains("/sandbox/"))
+                    })
+                    .filter_map(|c| c["id"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for uuid in &sandbox_uuids {
+            if let Err(e) = self.ensure_fgap_permissions(uuid, "").await {
+                tracing::warn!(%uuid, %e, "FGAP sync failed for sandbox");
+            }
+        }
+        Ok(())
+    }
+
+    /// Creates a Keycloak client for an audience service (e.g. model-api)
+    /// with the `openshell.audience` and `standard.token.exchange.enabled` markers.
+    pub async fn ensure_audience_client(&self, client_id: &str) -> Result<(), String> {
+        if self.client_uuid(client_id).await?.is_some() {
+            return Ok(());
+        }
+        let body = json!({
+            "clientId": client_id,
+            "enabled": true,
+            "publicClient": false,
+            "standardFlowEnabled": false,
+            "directAccessGrantsEnabled": false,
+            "serviceAccountsEnabled": false,
+            "attributes": {
+                "openshell.audience": "true",
+                "standard.token.exchange.enabled": "true",
+            },
+        });
+        self.admin(Method::POST, "/clients", Some(&body)).await?;
+        Ok(())
+    }
+
+    /// Removes a Keycloak audience client. Missing client is not an error.
+    pub async fn delete_audience_client(&self, client_id: &str) -> Result<(), String> {
+        if let Some(uuid) = self.client_uuid(client_id).await? {
+            self.admin_allow_missing(Method::DELETE, &format!("/clients/{uuid}"))
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Removes everything `ensure_sandbox` created. Missing objects are not errors.
     pub async fn delete_sandbox(&self, spiffe_id: &str) -> Result<(), String> {
         if let Some(scope) = self.scope_uuid(spiffe_id).await? {
