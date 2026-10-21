@@ -8,7 +8,7 @@ End-to-end demo of workload identity with user delegation on OpenShift, using SP
 [![asciicast](https://asciinema.org/a/tETTOnFHnUFyYLSL.svg)](https://asciinema.org/a/tETTOnFHnUFyYLSL)
 
 **Automated FGAP** (zero-config: sandbox create → interceptor → FGAP → exchange):
-[![asciicast](https://asciinema.org/a/wUwNJCreRCZtifEI.svg)](https://asciinema.org/a/wUwNJCreRCZtifEI)
+[![asciicast](https://asciinema.org/a/X7avOsSS0gvH4ku6.svg)](https://asciinema.org/a/X7avOsSS0gvH4ku6)
 
 ## What it demonstrates
 
