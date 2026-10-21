@@ -200,15 +200,44 @@ impl KeycloakAdmin {
     /// When the `admin-fine-grained-authz:v1` feature is active on the realm,
     /// `standard.token.exchange.enabled` is ignored; permissions must be set
     /// explicitly on the realm-management authorization server.
+    async fn discover_audience_clients(&self) -> Result<Vec<String>, String> {
+        let all_clients = self
+            .admin(Method::GET, "/clients?max=200", None)
+            .await?;
+        let mut audiences = vec![];
+        if let Some(clients) = all_clients.as_array() {
+            for client in clients {
+                let is_federated = client["clientAuthenticatorType"] == "federated-jwt";
+                let is_realm_mgmt = client["clientId"] == "realm-management";
+                let is_admin = client["clientId"] == "admin-cli";
+                let is_registrar = client["clientId"] == "keycloak-registrar";
+                let is_builtin = client["clientId"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("account") || id == "broker" || id == "security-admin-console");
+                if is_federated || is_realm_mgmt || is_admin || is_registrar || is_builtin {
+                    continue;
+                }
+                let has_exchange = client["attributes"]["standard.token.exchange.enabled"]
+                    .as_str()
+                    .is_some_and(|v| v == "true");
+                let has_marker = client["attributes"]["openshell.audience"]
+                    .as_str()
+                    .is_some_and(|v| v == "true");
+                if has_exchange || has_marker {
+                    if let Some(uuid) = client["id"].as_str() {
+                        audiences.push(uuid.to_string());
+                    }
+                }
+            }
+        }
+        Ok(audiences)
+    }
+
     async fn ensure_fgap_permissions(
         &self,
         sandbox_uuid: &str,
         _spiffe_id: &str,
     ) -> Result<(), String> {
-        if self.config.default_scopes.is_empty() {
-            return Ok(());
-        }
-
         let realm_mgmt = match self.client_uuid("realm-management").await? {
             Some(uuid) => uuid,
             None => return Ok(()),
@@ -246,14 +275,23 @@ impl KeycloakAdmin {
 
         let participant_policies = [sandbox_policy_id, gateway_policy_id];
 
-        // Build list of all targets: audience clients + sandbox + gateway.
-        // Each needs management permissions enabled and a token-exchange
-        // scope permission that includes both participant policies.
-        let mut targets: Vec<String> = vec![];
-        for scope_name in &self.config.default_scopes {
-            if let Some(uuid) = self.client_uuid(scope_name).await? {
-                targets.push(uuid);
+        // Discover audience clients: auto-detect from Keycloak attributes,
+        // fall back to DEFAULT_CLIENT_SCOPES if no clients have the marker.
+        let discovered = self.discover_audience_clients().await?;
+        let mut targets: Vec<String> = if !discovered.is_empty() {
+            discovered
+        } else {
+            let mut from_scopes = vec![];
+            for scope_name in &self.config.default_scopes {
+                if let Some(uuid) = self.client_uuid(scope_name).await? {
+                    from_scopes.push(uuid);
+                }
             }
+            from_scopes
+        };
+
+        if targets.is_empty() {
+            return Ok(());
         }
         targets.push(sandbox_uuid.to_string());
         if !targets.contains(&gateway_uuid) {
